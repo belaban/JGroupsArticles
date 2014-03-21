@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+<HTML>
+<HEAD>
+	<META HTTP-EQUIV="CONTENT-TYPE" CONTENT="text/html; charset=utf-8">
+	<TITLE></TITLE>
+	<META NAME="GENERATOR" CONTENT="OpenOffice.org 3.0  (Unix)">
+	<META NAME="AUTHOR" CONTENT="Bela Ban">
+	<META NAME="CREATED" CONTENT="20080902;13355100">
+	<META NAME="CHANGEDBY" CONTENT="Bela Ban">
+	<META NAME="CHANGED" CONTENT="20090119;11073700">
+	<META NAME="Info 1" CONTENT="">
+	<META NAME="Info 2" CONTENT="">
+	<META NAME="Info 3" CONTENT="">
+	<META NAME="Info 4" CONTENT="">
+	<STYLE TYPE="text/css">
+	<!--
+		@page { margin: 0.79in }
+		P { margin-bottom: 0.08in }
+		H1 { margin-bottom: 0.08in }
+		H1.western { font-family: "Arial", sans-serif; font-size: 16pt }
+		H1.cjk { font-family: "DejaVu Sans"; font-size: 16pt }
+		H1.ctl { font-family: "Tahoma"; font-size: 16pt }
+		TD P { margin-bottom: 0in }
+		CODE { font-family: "DejaVu LGC Sans Mono", monospace }
+		A.western:visited { so-language: en-US }
+		A.cjk:visited { so-language: zxx }
+		A.ctl:visited { so-language: zxx }
+		A.sdfootnoteanc { font-size: 57% }
+	-->
+	</STYLE>
+</HEAD>
+<BODY LANG="en-US" DIR="LTR">
+<P ALIGN=CENTER STYLE="margin-top: 0.17in; page-break-after: avoid"><FONT FACE="Arial, sans-serif"><FONT SIZE=5><B>Dynamic
+caching in the cloud with ReplCache</B></FONT></FONT></P>
+<P><BR><BR>
+</P>
+<P>Bela Ban, JBoss</P>
+<P>February 2009</P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Overview</H1>
+<P>In a <A CLASS="western" HREF="http://www.jgroups.org/javagroupsnew/docs/memcached.html">previous
+article </A>I wrote about an implementation of <A CLASS="western" HREF="http://www.danga.com/memcached">memcached</A>
+on JGroups.</P>
+<P><A CLASS="western" HREF="http://www.jgroups.org/javagroupsnew/docs/replcache.html">ReplCache</A>
+is a large virtual hashmap spanning multiple nodes, similar to
+memcached. If we have 5 processes (nodes) with 1GB of memory
+allocated to each of their hashmap, then we have a virtual hashmap of
+5GB. By starting another nodes, the size would increase to 6GB, and
+if a node leaves, the size shrinks accordingly.</P>
+<P>When we distribute our elements (key and values) to the virtual
+hashmap, then – based on <A CLASS="western" HREF="http://weblogs.java.net/blog/tomwhite/archive/2007/11/consistent_hash.html">consistent
+hashing</A> – an element gets assigned to a single node, and so we
+can use the full 5GB. Reads and writes are always sent to the same
+node using the consistent hash of the key. If the node storing
+element K crashes, the next read returns null, and the user has to
+retrieve K from the database and re-insert it into the virtual
+hashmap, this time picking a different node.</P>
+<P><I>Distribution</I> therefore always requires some stable storage
+(e.g. a DB) from which we can retrieve our elements should a node
+hosting an element crash. All writes are of course also written to
+the DB in this case. 
+</P>
+<P>Distribution is similar to <A CLASS="western" HREF="http://en.wikipedia.org/wiki/RAID_0">RAID
+0</A>.</P>
+<P>If we don't want to use a database, e.g. because it is a single
+point of failure, and access to it is slow, we can just keep our data
+in memory. However, to prevent data loss due to a node crash, we have
+to replicate all elements.</P>
+<P><I>Replication</I> is the opposite of distribution: we have a copy
+of a given element K on every node. Should a node crash, clients can
+simply pick a different node and K is still present. Updates to K
+have to be sent to all nodes. Note that to prevent a catastrophic
+failure in which all nodes in the cloud crash, we could still write
+updates to the DB, but this could be done in the background.</P>
+<P>While replication increases availability and prevents data loss,
+we can now effectively only use 1GB out of the 5GB of the above
+example: if a node has 1GB of data, and every node replicates its
+data to every other node in the 5 node cluster, we'd use up the 5GB
+available to us. 
+</P>
+<P>Replication is similar to <A CLASS="western" HREF="http://en.wikipedia.org/wiki/RAID_1">RAID
+1</A>.</P>
+<P>So we can either choose to not replicate anything with potential
+data loss but maximal use of the 5GB, or replicate everything to
+everyone, which minimizes the risk of data loss but limits us to 1GB
+out of the 5GB.</P>
+<P><A CLASS="western" HREF="http://en.wikipedia.org/wiki/RAID_5">RAID
+5</A> is a solution which doesn't replicate data everywhere (it only
+replicates it K times where K &lt; number of disks) and increases the
+use of the available size. However, K is fixed and for RAID 5 to
+work, we need at least 3 disk.</P>
+<P>Enter ReplCache, which allows a developer to define how many times
+an element should be available in a cluster. <I>This is defined per
+data item with a replication count (K)</I>:</P>
+<UL>
+	<LI><P>K == -1: the element is stored on all cluster nodes (full
+	replication)</P>
+	<LI><P>K == 1: the element stored on a single node only, determined
+	through consistent hashing (distribution)</P>
+	<LI><P>K &gt; 1: the element is stored K times in the cluster</P>
+</UL>
+<P><BR><BR>
+</P>
+<P>If an element is important, and loss is catastrophic or recreation
+costly, then -1 should be chosen. If an element can easily be fetched
+from the database again, then 1 might be picked. A value greater than
+1 decreases the risk of data loss and saves memory, e.g. if K == 3 (N
+== 10), then 3 cluster nodes have to crash at the same time to lose
+K. If they don't crash simultaneously, the cluster will rebalance its
+data so that K == 3 (unless N &lt; K).</P>
+<P>The advantage of defining K per data element is that an
+application can define data reliability and thus use more of the
+virtual memory allocated<A CLASS="sdfootnoteanc" NAME="sdfootnote1anc" HREF="#sdfootnote1sym"><SUP>1</SUP></A>.</P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">API</H1>
+<P><BR><BR>
+</P>
+<P>The API is trivial and consists of put(), get() and remove().</P>
+<P STYLE="margin-left: 0.02in; border: 1px solid #000000; padding: 0.02in; page-break-inside: avoid; page-break-before: auto">
+</SPAN><CODE><FONT SIZE=2>public void put(K key, V val, short
+repl_count, long timeout)</FONT></CODE></P>
+<P>Stores a key and value in the cloud.</P>
+<TABLE WIDTH=100% BORDER=1 BORDERCOLOR="#000000" CELLPADDING=4 CELLSPACING=0>
+	<COL WIDTH=55*>
+	<COL WIDTH=201*>
+	<TR VALIGN=TOP>
+		<TD WIDTH=22%>
+			<P>key</P>
+		</TD>
+		<TD WIDTH=78%>
+			<P>The key to insert into the cloud</P>
+		</TD>
+	</TR>
+	<TR VALIGN=TOP>
+		<TD WIDTH=22%>
+			<P>val</P>
+		</TD>
+		<TD WIDTH=78%>
+			<P>The value to insert into the cloud. Note that key and val have
+			to be serializable because they are sent over the network</P>
+		</TD>
+	</TR>
+	<TR VALIGN=TOP>
+		<TD WIDTH=22%>
+			<P>repl_count</P>
+		</TD>
+		<TD WIDTH=78%>
+			<P>The number of replicas of key and val that should be in the
+			cloud:</P>
+			<P>-1: store on all nodes in the cloud</P>
+			<P>1: store on a single node in the cloud</P>
+			<P>&gt;1: store on multiple nodes</P>
+		</TD>
+	</TR>
+	<TR VALIGN=TOP>
+		<TD WIDTH=22%>
+			<P>timeout (ms)</P>
+		</TD>
+		<TD WIDTH=78%>
+			<P>Number of milliseconds after which a key/value will be evicted
+			if not accessed:</P>
+			<P>0: cache forever</P>
+			<P>-1: don't cache at all</P>
+			<P>&gt; 0: cache for timeout ms</P>
+		</TD>
+	</TR>
+</TABLE>
+<P><BR><BR>
+</P>
+<P><BR><BR>
+</P>
+<P STYLE="margin-left: 0.02in; border: 1px solid #000000; padding: 0.02in; page-break-inside: avoid; page-break-before: auto">
+</SPAN><CODE><FONT SIZE=2>public V get(K key)</FONT></CODE></P>
+<P>Returns a value associated with a given key. If the key has no
+associated value, null will be returned.</P>
+<P><BR><BR>
+</P>
+<P STYLE="margin-left: 0.02in; border: 1px solid #000000; padding: 0.02in; page-break-inside: avoid; page-break-before: auto">
+</SPAN><CODE><FONT SIZE=2>public void remove(K key)</FONT></CODE></P>
+<P>Removes a key and value from the cloud.</P>
+<H1 CLASS="western">Maintaining replicas</H1>
+<P>When new nodes are added to the cluster, or removed from the
+cluster, ReplCache has to make sure that elements with K == 1 are
+still stored on the correct node, based on the consistent hash and
+the new cluster topology. 
+</P>
+<P>Also, with elements that are stored multiple times in the cluster
+(K &gt; 1), ReplCache has to make sure that elements are moved or
+copied to other nodes. For example, if id=322649 has K == 3 and the
+cluster has nodes A and B, 'id' will be stored on A and B. As soon as
+C is added, we also have to copy 'id' to C in order to have 3 copies
+available. When D is added, we have to figure out whether to store
+'id' on D, too. If that's the case, 'id' can be removed on either A,
+B or C.</P>
+<P>To handle the latter case (K &gt; 1), we compute K hash codes for
+the changed cluster topology and pick K nodes (NEW-NODES). Then we
+compute K hash codes for the old cluster topology and pick K nodes
+(OLD-NODES). If NEW-NODES is the same as OLD-NODES, we don't need to
+rebalance a given element. If not, we multicast a PUT, which every
+node receives. Every node then checks whether it is in the NEW-NODES
+set for the given key and applies the PUT if so, or discards it if
+not.</P>
+<P><BR><BR>
+</P>
+<P><BR><BR>
+</P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Conclusion</H1>
+<P>ReplCache is a clustered cache, spanning multiple nodes. 
+</P>
+<P>Elements can be distributed and optionally replicated to
+optimimally store them in the cloud, giving applications control over
+space versus reliability tradeoffs by defining replication counts for
+individual elements.</P>
+<P>We're looking into defining regions of keys, where sets of related
+keys are co-located on the same nodes. This would require the
+addition of a parameter 'region', which is then used as input to the
+consistent hash function (rather than using the key directly). An
+example that would benefit from this is HTTP sessions: all attributes
+of a given session would be co-located.</P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Links</H1>
+<P>[1] ReplCache:
+<A CLASS="western" HREF="http://www.jgroups.org/javagroupsnew/docs/replcache.html">http://www.jgroups.org/javagroupsnew/docs/replcache.html</A></P>
+<P>[2] JGroups: <A CLASS="western" HREF="http://www.jgroups.org/">http://www.jgroups.org</A></P>
+<P>[3] Memcached article:
+<A CLASS="western" HREF="http://www.jgroups.org/javagroupsnew/docs/memcached.html">http://www.jgroups.org/javagroupsnew/docs/memcached.html</A></P>
+<P><BR><BR>
+</P>
+<DIV ID="sdfootnote1">
+	<P><A CLASS="sdfootnotesym" NAME="sdfootnote1sym" HREF="#sdfootnote1anc">1</A>Compare
+	this to for example RAID 1 where everything is replicated, even
+	directories like /tmp, which are probably not needed in a crash
+	case.</P>
+</DIV>
+</BODY>
+</HTML>

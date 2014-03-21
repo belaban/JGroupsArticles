@@ -1,0 +1,1314 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+<HTML>
+<HEAD>
+	<META HTTP-EQUIV="CONTENT-TYPE" CONTENT="text/html; charset=utf-8">
+	<TITLE></TITLE>
+	<META NAME="GENERATOR" CONTENT="OpenOffice.org 3.0  (Unix)">
+	<META NAME="AUTHOR" CONTENT="Bela Ban">
+	<META NAME="CREATED" CONTENT="20080904;10594200">
+	<META NAME="CHANGEDBY" CONTENT="Bela Ban">
+	<META NAME="CHANGED" CONTENT="20090121;11214300">
+	<META NAME="Info 1" CONTENT="">
+	<META NAME="Info 2" CONTENT="">
+	<META NAME="Info 3" CONTENT="">
+	<META NAME="Info 4" CONTENT="">
+	<STYLE TYPE="text/css">
+	<!--
+		@page { margin: 0.79in }
+		P { margin-bottom: 0.08in }
+		H1 { margin-bottom: 0.08in }
+		H1.western { font-family: "Arial", sans-serif; font-size: 16pt }
+		H1.cjk { font-family: "DejaVu Sans"; font-size: 16pt }
+		H1.ctl { font-family: "Tahoma"; font-size: 16pt }
+		P.sdfootnote { margin-left: 0.2in; text-indent: -0.2in; margin-bottom: 0in; font-size: 10pt }
+		H2 { margin-bottom: 0.08in }
+		H2.western { font-family: "Arial", sans-serif; font-size: 14pt; font-style: italic }
+		H2.cjk { font-family: "DejaVu Sans"; font-size: 14pt; font-style: italic }
+		H2.ctl { font-size: 14pt; font-style: italic }
+		CODE { font-family: "DejaVu LGC Sans Mono", monospace }
+		TT { font-family: "DejaVu LGC Sans Mono", monospace }
+		A.sdfootnoteanc { font-size: 57% }
+	-->
+	</STYLE>
+</HEAD>
+<BODY LANG="en-US" DIR="LTR">
+<H1 CLASS="western">A simple clustered task distribution system</H1>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">Bela Ban</P>
+<P STYLE="margin-bottom: 0in">Sept 2008</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">This article will introduce the basic
+concepts of <A HREF="http://www.jgroups.org/">JGroups</A> ([1]) and
+then implement a task distribution system (on top of JGroups), where
+tasks can be placed into the cluster and are executed by worker
+nodes. 
+</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">I'll show that worker nodes can be
+added at run time to add more processing power, or taken down when we
+don't have much load. Plus, tasks assigned to workers who
+subsequently crash are automatically reassigned to live nodes.</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">We could have implemented this with JMS
+queues. However, when we have a lot of load, the JMS server tends to
+become the bottleneck. In our decentralized solution, every node in
+the cluster can be both a master (who submits tasks) and a slave (who
+executes the tasks and returns the results).</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<H1 CLASS="western">JGroups</H1>
+<H2 CLASS="western">Overview</H2>
+<P>JGroups is a clustering library. Applications can use JGroups to
+join a cluster, send messages to the cluster nodes, get notifications
+when other nodes join or leave (including crashes), and leave a
+cluster.</P>
+<P>Its task is the reliable sending of messages within a cluster. Its
+scope is much smaller than JMS; JGroups doesn't know about queues,
+topics and transactions, but only about message sending.</P>
+<P>The main feature of JGroups is the protocol stack and the
+resulting configuration flexibility. Applications can pick the
+properties they would like in a cluster by simply editing an XML
+file. 
+</P>
+<P>For example, an application can add compression by simply adding
+the COMPRESS protocol to the configuration. 
+</P>
+<P>Or it can remove fragmentation because its messages will always be
+smaller than 65K (over UDP), or because it uses TCP as transport. 
+</P>
+<P>Another application might add encryption and authentication, so
+messages are encrypted and only nodes which present a valid X.509
+certificate can join the cluster.</P>
+<P>Applications are even free to write their own protocols (or extend
+an existing one), and add them to the configuration. It might be
+useful for example, to add a protocol which keeps track of all
+messages sent and received over a cluster, for auditing or statistics
+purposes.</P>
+<P>The architecture of JGroups is shown in fig. 1.</P>
+<P>The main API for clients is a Channel (see below) which is used to
+send and receive messages. When a message is sent, it is passed down
+the protocol stack. The stack is a list of protocols, and each
+protocol gets a chance to do something with the message.</P>
+<P>For example, a fragmentation protocol might check the size of the
+message. If the message is greater than the configured size, it might
+fragment it into multiple smaller messages and send those down the
+stack.</P>
+<P><SPAN ID="Frame2" DIR="LTR" STYLE="float: left; width: 80%; height: 50%; border: none; padding: 0in; background: #ffffff">
+	<P STYLE="margin-top: 0.08in"><IMG SRC="TaskDistribution_html_m7849c8fb.gif" NAME="Object2" ALIGN=LEFT WIDTH=90% HEIGHT=100%><FONT SIZE=3><I>Illustration
+	1: JGroups architecture</I></FONT></P>
+</SPAN><BR CLEAR=LEFT><BR><BR>
+</P>
+<P>On the receive side, the fragmentation protocol would queue the
+fragments, until all have been received, then assemble them into the
+original message and pass it up.</P>
+<P>The protocols shipped with JGroups can be divided into the
+following categories:</P>
+<UL>
+	<LI><P>Transport: sending and receiving of messages. UDP uses IP
+	multicasting and/or UDP datagrams. TCP uses TCP connections.</P>
+	<LI><P>Discovery: initial discovery of nodes</P>
+	<LI><P>Merging: after a network partition heals, this merges the
+	sub-clusters back into one</P>
+	<LI><P>Failure detection: monitoring of cluster nodes and
+	notifications of potential crashes or hangs</P>
+	<LI><P>Reliable delivery: makes sure a message is not lost, received
+	only once, and received in the order in which a sender sent it. This
+	is done through assigning sequence numbers to each message and
+	through retransmission in case of a missing message.</P>
+	<LI><P>Stability: nodes have to buffer all messages (for potential
+	retransmission). The stability protocol makes sure that periodically
+	(or based on accumulated size), messages that have been received by
+	all cluster nodes are purged so they can be garbage collected.</P>
+	<LI><P>Group membership: keeps track of the nodes in a cluster, and
+	notifies the application of node joins and leaves (including
+	crashes)</P>
+	<LI><P>Flow control: makes sure that a sender cannot send messages
+	faster than the receivers can process them, over a longer time. This
+	is necessary to prevent out-of-memory situations. Flow control is a
+	counter part to stability.</P>
+	<LI><P>Fragmentation: fragments large messages into smaller ones and
+	re-assembles them at the receivers</P>
+	<LI><P>State transfer: makes sure that the shared state of a cluster
+	(e.g. all HTTP sessions) is transferred correctly to a new node</P>
+	<LI><P>Compression: compresses messages and uncompresses them at the
+	receivers</P>
+	<LI><P>Encryption: encrypts messages</P>
+	<LI><P>Authentication: prevents unauthorized node from joining a
+	cluster</P>
+</UL>
+<P><BR><BR>
+</P>
+<H2 CLASS="western">API</H2>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">The main API is org.jgroups.JChannel:</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public class JChannel
+extends Channel {</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public JChannel(String
+properties) throws ChannelException;</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+setReceiver(Receiver r);</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+connect(String cluster_name) throws ChannelException;</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+send(Message msg) throws ChannelException;</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public View getView();</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public Address
+getLocalAddress();</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+disconnect();</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void close();</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">We join a cluster by creating a channel
+and calling connect():</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">Channel ch=new
+JChannel(“/home/bela/udp.xml”);</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">ch.setReceiver(new
+ReceiverAdapter() {</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+receive(Message msg) {}</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">});</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">ch.connect(“demo-cluster”);</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">This creates a channel with a protocol
+stack defined in /home/bela/udp.xml. If an application needs
+different properties, it would modify udp.xml and pass the modified
+XML file to the constructor.</P>
+<P STYLE="margin-bottom: 0in">Then we set a Receiver, which has
+callbacks that are invoked when messages are received. Finally, we
+join cluster “demo-cluster”. All channels with the same
+configuration and the same cluster name (argument of connect()) will
+join the same cluster.</P>
+<P STYLE="margin-bottom: 0in">A node can send and receive messages
+once it has joined a cluster.</P>
+<P STYLE="margin-bottom: 0in">The Receiver interface has 2 methods
+we're interested in:</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">void receive(Message msg);</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">void viewAccepted(View
+new_view);</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">The receive() callback is invoked
+whenever a message is received<A CLASS="sdfootnoteanc" NAME="sdfootnote1anc" HREF="#sdfootnote1sym"><SUP>1</SUP></A>.
+Its argument is an org.jgroups.Message:</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public class Message
+implements Streamable {</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">protected Address
+dest_addr=null;</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">protected Address
+src_addr=null;</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private byte[]   
+buf=null;</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<BR>
+</P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public byte[]
+getBuffer();</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+setBuffer(byte[] b);</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">A message has the address of the
+destination (dest_addr) and sender (src_addr) and a payload (buf). An
+Address is an opaque class identifying a node uniquely within a
+cluster<A CLASS="sdfootnoteanc" NAME="sdfootnote2anc" HREF="#sdfootnote2sym"><SUP>2</SUP></A>.
+A destination address of null means that the message is to be sent to
+all cluster nodes (a multicast), a non-null destination address means
+to send the message to a single receiver (a unicast).</P>
+<P STYLE="margin-bottom: 0in">When receiving a message, the
+application can call getBuffer() to retrieve the byte[] buffer and
+then unmarshal it into data meaningful to the application.</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">The viewAccepted() callback is invoked
+when a node joins or leaves. Its only parameter is a View, which is
+essentially a list of addresses. Views are received by all cluster
+nodes in exactly the same order, so when we have a cluster {A,B,C},
+then the nodes have the following views:</P>
+<UL>
+	<LI><P STYLE="margin-bottom: 0in">A: {A,B,C}</P>
+	<LI><P STYLE="margin-bottom: 0in">B: {A,B,C}</P>
+	<LI><P STYLE="margin-bottom: 0in">C: {A,B,C}</P>
+</UL>
+<P STYLE="margin-bottom: 0in">If we had a new node D joining, then
+the view would become {A,B,C,D}. If B crashed, then everyone would
+install {A,C,D}. As we can see, the nodes in a view are ordered
+according to join time.</P>
+<P STYLE="margin-bottom: 0in">The oldest node is always first.</P>
+<P STYLE="margin-bottom: 0in">The current view can also be retrieved
+from a channel by calling Channel.getView().</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">Let's now discuss the remaining methods
+of JChannel.</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">The send() method takes a Message and
+sends it to all cluster nodes if the message's destination is null,
+or to a single node if the destination is non-null. The application
+needs to marshal their data to a byte[] buffer and set place it into
+the message via Message.setBuffer().</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">To retrieve the current view, we can
+use Channel.getView() and to fetch the local address of a node, we
+call Channel.getLocalAddress().</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">The disconnect() method leaves a
+cluster and close() destroys the channel. A closed channel cannot be
+opened again. Invoking close() also disconnects a channel if not
+already disconnected.</P>
+<P STYLE="margin-bottom: 0in">Calling disconnect() will install a new
+view in all cluster nodes, and viewAccepted() will be invoked in all
+receivers.</P>
+<P STYLE="margin-bottom: 0in"><BR>
+</P>
+<P STYLE="margin-bottom: 0in">As we will see in building our task
+distribution system, the use of JGroups allows us to focus on the
+system at hand, and not have to worry about clustering issues, as
+JGroups does the heavy lifting. The main features used in our system
+are membership management (we need to know who the cluster nodes are,
+and when a node joins or leaves) and reliable messaging (for task
+sending). Plus, by modifying the protocol configuration, we can adapt
+the transport to our needs.</P>
+<H1 CLASS="western">Task distribution system</H1>
+<P><BR><BR>
+</P>
+<P>The idea is very simple: we have a cluster of nodes, and each node
+can submit tasks to be executed by some other node in the cluster. So
+every node is a peer, in the sense that it can both <I>submit</I> and
+<I>handle</I> tasks. In a real life application, clients would
+connect to <I>any</I> of the nodes, e.g. via TCP or RMI, and submit
+tasks to that node, which would then distribute it to some other node
+(or handle it itself).</P>
+<P>When submitting a task, we choose a random integer which is then
+mapped to the rank of a node in the cluster (int mod N where N is the
+cluster size). The rank is the position of a node in the view, and
+since the view is the same in all nodes, the rank identifies the node
+uniquely.</P>
+<P>The task is then multicast (EXECUTE) across the cluster. Every
+node adds the task to a hash map consisting of tasks and their
+submitters' (JGroups) addresses.</P>
+<P>Every node now compares the rank shipped with the task to its own
+rank. It it doesn't match, nothing is done. If it matches, the node
+needs to process the task. It does so and returns the result to the
+submitter.</P>
+<P>When the submitter receives the response (RESULT), it multicasts a
+REMOVE message across the cluster. Upon reception of REMOVE(T), every
+node removes T from its hash map</P>
+<P>If a node X crashes (or leaves gracefully), we know which tasks
+were assigned to it by looking up the tasks in the hash map, keyed by
+X. All tasks which are still present in the hash map have not yet
+been processed and need to be re-executed, this time by a different
+node. This is done by comparing the rank shipped with the task to the
+node's rank and executing it if a node's own rank matches it.</P>
+<P>If a master M crashes after having submitted a few tasks but not
+yet having received the results, the slaves remove all tasks
+submitted by M, because M won't need the results anymore<A CLASS="sdfootnoteanc" NAME="sdfootnote3anc" HREF="#sdfootnote3sym"><SUP>3</SUP></A>.</P>
+<P>Fig. 2 shows how task distribution in a cluster looks like. 
+</P>
+<P>The cluster consists of nodes A, B, C and D. Clients can access
+any one of them. A task submitted for example to B by a client might
+assign 23 to the task. B then multicasts an EXECUTE(23, TASK) message
+to all nodes in the cluster, and every node adds task #23 to its
+cache. 
+</P>
+<P>However, the only node processing task #23 is A (to which 23
+happens to map to), which then sends the result as a RESULT(23, OBJ)
+to B. B returns the result OBJ to the client and multicasts a
+REMOVE(23) message to the cluster, which causes all nodes to remove
+task #23 from their caches.</P>
+<P>Had A crashed during processing of task #23, some other node would
+have taken over, processed the result and sent it back to B.</P>
+<P><SPAN ID="Frame1" DIR="LTR" STYLE="float: left; width: 75%; height: 47%; border: none; padding: 0in; background: #ffffff">
+	<P STYLE="margin-top: 0.08in"><IMG SRC="TaskDistribution_html_m6ea77dfc.gif" NAME="Object1" ALIGN=LEFT WIDTH=90% HEIGHT=99%><BR CLEAR=LEFT><FONT SIZE=3><I>Illustration
+	2: Task distribution in a cluster</I></FONT></P>
+</SPAN><BR CLEAR=LEFT><BR><BR>
+</P>
+<P><BR><BR>
+</P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Code</H1>
+<P>Let's look at how we implement this<A CLASS="sdfootnoteanc" NAME="sdfootnote4anc" HREF="#sdfootnote4sym"><SUP>4</SUP></A>.
+We'll write a Server class which has the main() loop and accepts
+requests which are to be distributed across the cluster. This mimics
+real clients sending requests to any cluster node. We can then start
+a number of Server processes, across the cluster or on the same host
+(for the demo).</P>
+<P>First, we need an ID (ClusterID) which is unique across the
+cluster and which is used to determine whether a node accepts a task.
+An instance of ClusterID is created for every task. The class looks
+as follows:</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in; page-break-before: auto">
+</SPAN>p<CODE><FONT SIZE=2 STYLE="font-size: 9pt">ublic class
+ClusterID implements Streamable {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private Address
+creator;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private  int id;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private static
+int next_id=1;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public static
+synchronized ClusterID create(Address addr) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">return new
+ClusterID(addr, next_id++);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+</SPAN><CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>Implementations of Streamable let JGroups marshal and unmarshal
+objects more efficiently.</P>
+<P>A ClusterID has the address of the node which created it and an ID
+which is incremented on each create() call. If we only used IDs,
+because every node could potentially submit tasks, we might end up
+with node A submitting task #23 and node C submitting task #23, and
+this would lead to issues with task entries getting overwritten in
+the cache hash map Prefixing the ID with its creator would yield
+A::23 and C::23, which are 2 different tasks.</P>
+<P>Then, we define the Master and Slaves interfaces:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public interface Master {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">Object submit(Task
+task, long timeout) throws Exception;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public interface Slave {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">Object handle(Task
+task);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>These interfaces are implemented by our Server class which does
+the bulk of the work. 
+</P>
+<P>The submit() method takes a task (see below) and a timeout. It can
+throw an exception or return a result. Note that both the Task
+subclasses and the result have to be serializable or Streamable,
+because they are potentially sent across the network to get executed.</P>
+<P>The handle(Task t) method is invoked at the slave, which is the
+worker node which decides that it will handle the task. It typically
+uses the data shipped with a task (subclass) and returns an object
+which needs to be serializable because in most cases, it will be sent
+back to the submitter via the network.</P>
+<P><BR><BR>
+</P>
+<P>Next, we define the Task:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public interface Task
+extends Serializable {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public abstract Object
+execute();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.02in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P><A NAME="DDE_LINK"></A>A task contains all of the necessary data
+that is shipped to a slave. The execute() method then uses that data
+to perform the processing and returns a result which is sent back to
+the master who submitted that task.</P>
+<P><BR><BR>
+</P>
+<P>Now that we've defined all the ancillary classes and interfaces,
+let's start writing the Server:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public class Server extends
+ReceiverAdapter implements Master, Slave {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private String
+props=&quot;udp.xml&quot;;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private Channel ch;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private final
+ConcurrentMap&lt;ClusterID,Entry&gt; tasks;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private final
+ExecutorService thread_pool=Executors.newCachedThreadPool();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private View view;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private int rank=-1;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private int
+cluster_size=-1;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void start()
+throws Exception {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">ch=new
+JChannel(props);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">ch.setReceiver(this);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">ch.connect(&quot;dzone-demo&quot;);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void stop() {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">thread_pool.shutdown();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">ch.close();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>Server implements the Master and Slave interfaces, which means
+that a Server can act both as a client (Master) and server (Slave).
+So the name “Server” is actually somewhat of a misnomer, as this
+is clearly more of a peer than a server !</P>
+<P>Next, we need a few instance variables. For instance, we need a
+JGroups channel (ch) which needs to be configured with properties
+(props) defining the configuration of the protocol stack.</P>
+<P>We also need a thread pool (thread_pool) to execute the tasks we
+receive to process. Here, we chose the a simple pool which creates
+new threads when needed and removes threads that have been idle for
+more than 60 seconds.</P>
+<P>The 'tasks' hash map is the cache for received tasks. It is keyed
+by ClusterId and the values are Entry instances (see below).</P>
+<P>The view, rank and cluster_size variables are needed to determine
+whether or not to process a received task. More on this later.</P>
+<P>In start(), we create a JChannel based on the properties passed to
+server and connect it, which causes it to join the cluster. Also, we
+set a Receiver, which means that we'll get receive(Message) and
+viewAccepted(View) callbacks whenever a message or view change is
+received.</P>
+<P>In stop(), we shut down the thread pool and close the channel,
+causing this node to leave the cluster gracefully. Everybody else
+connected to this cluster will get a view change (viewAccepted()
+callback) notifying them of the termination of this node.</P>
+<P><BR><BR>
+</P>
+<P>The Entry class (inner class of Server) is shown below:</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">private static class Entry
+{</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private final Task
+task;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private final Address
+submitter;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private final
+Promise&lt;Object&gt; promise=new Promise&lt;Object&gt;();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P>It is a wrapper for the task, the address of the submitter and the
+promise (similar to a Future) used to block on until the result has
+been received. The address of the submitter of the task is needed to
+send the result back. This is necessary when a node other than the
+originally assigned one takes over and processes a task.</P>
+<P><BR><BR>
+</P>
+<P>Another inner class of Server is Request, which is used to send
+requests and responses between submitters (masters) and slaves:</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public static class
+Request implements Streamable {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">static enum Type
+{EXECUTE, RESULT, REMOVE};</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">private Type type;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">private Task task;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">private ClusterID
+id;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">private Object
+result;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>A Request also implements Streamable (implementation not shown)
+which allows for more efficient marshalling. We're sending 3 types of
+requests around:</P>
+<OL>
+	<LI><P>EXECUTE: multicast by the submitter to all nodes of the
+	cluster. It contains the task and a ClusterID, generated by the
+	submitter and used by the slave to determine whether or not to
+	accept the task. Note that only <B>one</B> slave in the entire
+	cluster will handle a given task.</P>
+	<LI><P>RESULT: contains the ClusterID and an Object (can be null if
+	nothing is returned, e.g. calling a void method). This is unicast
+	from the slave to the master which submitted the task.</P>
+	<LI><P>REMOVE: only contains the ClusterID and is multicast by the
+	submitter of a task T after the result for T has been received.
+	Everyone removes the task from their cache upon reception of this
+	message.</P>
+</OL>
+<P><BR><BR>
+</P>
+<P>Now that we have all the bits and pieces in place, it is actually
+time to look at the submit() method:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public Object
+submit(Task task, long timeout) throws Exception {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">ClusterID
+id=ClusterID.create(ch.getLocalAddress());</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">try {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">Request req=new
+Request(Request.Type.EXECUTE, task, id, null);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">byte[]
+buf=Util.streamableToByteBuffer(req);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">Entry entry=new
+Entry(task, ch.getLocalAddress());</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">tasks.put(id,
+entry);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">ch.send(new
+Message(null, null, buf));</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">return
+entry.promise.getResultWithTimeout(timeout);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">catch(Exception ex)
+{</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">tasks.remove(id);
+// remove it again</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">throw ex;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>This is an implementation of the Master interface. It generates a
+ClusterId and constructs a Request instance of type EXECUTE,
+containing the task and the ClusterID.</P>
+<P>Util.streamableToByteBuffer() is a helper method provided by
+JGroups, which takes a Streamable object and marshals it into a
+byte[] buffer. Remember that JGroups can only ship byte[] buffers
+over the wire.</P>
+<P>Then we add the task to our local cache, create a message with
+destination of null (= multicast) and the marshalled request.</P>
+<P>Finally we block on the promise of Entry until a result has been
+received or we get an exception (e.g. a timeout).</P>
+<P><BR><BR>
+</P>
+<P>The Slave part for handling of received tasks is simple:</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public Object
+handle(Task task) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">return
+task.execute();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P>We simply take the task and call execute() on it.</P>
+<P><BR><BR>
+</P>
+<P>In the Server.start() method, we created a JChannel and set the
+Receiver to be the Server itself. We implement 2 methods:
+receive(Message) and viewAccepted(View). The receive() method is
+shown below:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">public void receive(Message
+msg) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">Request
+req=(Request)Util.streamableFromByteBuffer(Request.class,
+msg.getBuffer());</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">switch(req.type) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">case EXECUTE:</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">handleExecute(req.id,
+msg.getSrc(), req.task);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">break;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">case RESULT:</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">Entry
+entry=tasks.get(req.id);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">entry.promise.setResult(req.result);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">multicastRemoveRequest(req.id);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">break;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">case REMOVE:</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">tasks.remove(req.id);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">break;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>The receive() method handles all requests and responses. Upon
+reception of a message, we need to grab its byte[] buffer, unmarshal
+it into a Request and then handle the request. We use the JGroups
+helper method Util.streamableFromByteBuffer() to do this.</P>
+<P>On reception of EXECUTE, we call handleExecute(), passing the
+ClusterID, the submitter and the task to it.</P>
+<P>On reception of RESULT (sent by a slave), we set the result in the
+promise, releasing the blocked submitter of the task. Then, we
+multicast a REMOVE request.</P>
+<P>On reception of REMOVE, we simply remove the task from our cache.</P>
+<P>The handleExecute() method checks if a node should accept the task
+and, if yes, passes it to a thread pool to execute:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private void
+handleExecute(ClusterID id, Address sender, Task task) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">tasks.putIfAbsent(id,
+new Entry(task, sender));</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">int
+index=id.getId() % cluster_size;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">if(index != rank)</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">return;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">thread_pool.execute(new
+Handler(id, sender, task);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>First, we add the task to our tasks cache, keyed by the
+ClusterID<A CLASS="sdfootnoteanc" NAME="sdfootnote5anc" HREF="#sdfootnote5sym"><SUP>5</SUP></A>.
+Then we take the ClusterID's ID, modulo the number of nodes in the
+cluster. This is the rank of the node which should execute the task.
+If it matches our own rank, we create a Handler and pass it to the
+thread pool to be executed on a separate thread, otherwise we return
+from handleExecute().</P>
+<P>The Handler class is shown below:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private class Handler
+implements Runnable {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">final ClusterID id;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">final Address
+sender;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">final Task task;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">public void run() {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">Object
+result=null;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">try {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">result=handle(task);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">catch(Throwable
+t) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">result=t;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">Request
+response=new Request(Request.Type.RESULT, null, id, result);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">byte[]
+buf=Util.streamableToByteBuffer(response);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">ch.send(new
+Message(sender, null, buf));</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>It executes the task against the Slave interface (handle() method)
+and stores the result. If there is an exception, then the exception
+(which is serializable by default) is stored as result instead.</P>
+<P>Then a Response object is created from the result.
+Util.streamableToByteBuffer() is called to generate a byte[] buffer
+from the response, which is then placed into a Message and sent via
+the channel to the original submitter of the task.</P>
+<P>Our code is now almost complete. The only thing missing is the
+handling of membership changes. Remember that we need to resubmit
+tasks from failed nodes, or from nodes who left gracefully, to other
+nodes. This is done in viewAccepted(View):</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public void
+viewAccepted(View view) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">List&lt;Address&gt;
+left_members=Util.leftMembers(this.view, view);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">this.view=view;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">Address
+local_addr=ch.getLocalAddress();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">cluster_size=view.size();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">Vector&lt;Address&gt;
+mbrs=view.getMembers();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">for(int i=0; i &lt;
+mbrs.size(); i++) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">Address
+tmp=mbrs.get(i);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">if(tmp.equals(local_addr))
+{</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">rank=i;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">break;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">if(left_members !=
+null &amp;&amp; !left_members.isEmpty()) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">for(Address
+mbr: left_members)</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">handleLeftMember(mbr);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>First, we determine which members left between the new and
+previous views. This is done with Util.leftMembers(), which returns a
+list of addresses of nodes which left between 2 views.</P>
+<P>Then we set the local address (Channel.getLocalAddress()),
+cluster_size and view.</P>
+<P>Next, the rank is computed by iterating through the new membership
+and comparing each element against the local address. On a match, our
+rank is the iteration counter. For example, if we have a membership
+of {A,B,C,D,E}, and we're C, then our rank will be 2.</P>
+<P>Finally, we need to determine whether any nodes left since the
+previous view, and whether there are any tasks to take over from
+them. This is done by iterating through all left members (if there
+are any) and calling handleLeftMember(), which is shown below:</P>
+<P><BR><BR>
+</P>
+<P STYLE="margin-bottom: 0in; border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">private void
+handleLeftMember(Address mbr) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">for(Map.Entry&lt;ClusterID,Entry&gt;
+entry: tasks.entrySet()) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">ClusterID
+id=entry.getKey();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">int
+index=id.getId() % cluster_size;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">if(index != rank)</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">return;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">Entry
+val=entry.getValue();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">if(mbr.equals(val.submitter))
+{</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">continue;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">execute(id,
+val.submitter, val.task);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE><FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>This method iterates through all cache entries and compares the ID
+(modulo cluster size) to our own rank. If it matches, we execute the
+task (unless the submitter itself left, in which case we drop the
+task)<A CLASS="sdfootnoteanc" NAME="sdfootnote6anc" HREF="#sdfootnote6sym"><SUP>6</SUP></A>.</P>
+<P>Note that both rank and cluster_size might change on receiving a
+new view. Both assignments need to happen <B>before</B>
+handleLeftMember() is called, as this method uses the 2 variables.
+For example, if we have cluster {A,B,C,D,E}, then C has rank=2 and D
+has rank=3. If C crashes, D's and E's ranks change: D's rank is now
+2. This means that D will process all of the tasks that C was
+processing and which hadn't completed by the time C crashed
+(otherwise C would have removed them).</P>
+<P>The code above has a deficiency though: assuming we have a cluster
+of {A,B,C,D} and A crashes, then the ranks of B, C and D change: B
+from 1 to 0, C from 2 to 1 and D from 3 to 2.</P>
+<P>This means that B, C and D will now execute tasks which were
+already being worked on by other nodes. For example, C will
+re-execute D's tasks and B will re-execute C's tasks. This is not
+incorrect, as the submitter of a task will remove the task when
+completed. So, when receiving a result R from a slave for a task
+which was already completed and therefore removed, the submitter just
+drops R.</P>
+<P>This is not wrong, but leads to spurious and unneeded processing.
+A better way to define the rank would be to use <A HREF="http://www.spiteful.com/2008/03/17/programmers-toolbox-part-3-consistent-hashing/">consistent
+hashing</A> ([2]), which minimizes changes to the rank and therefore
+re-execution of tasks already being worked on by other nodes.</P>
+<P><BR><BR>
+</P>
+<P>Our code is now complete. The last thing to do is to write the
+driver code, which we also add to Server:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">public static void
+main(String[] args) throws Exception {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">Server server=new
+Server(props);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">server.start();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">loop(server);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<BR><BR>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">private static void
+loop(Server server) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">boolean
+looping=true;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">while(looping) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">int
+key=Util.keyPress(&quot;[1] Submit [2] Submit long running task [q]
+Quit&quot;);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">switch(key) {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">case '1':</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">Task
+task=new Task() {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                        <FONT SIZE=2 STYLE="font-size: 9pt">public
+Object execute() { </FONT></CODE>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                            <FONT SIZE=2 STYLE="font-size: 9pt">return
+new Date();                       </FONT></CODE>
+</P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">};</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">log(&quot;&lt;==
+result = &quot; + server.submit(task, 30000));</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">break;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                <FONT SIZE=2 STYLE="font-size: 9pt">case '2':</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">task=new
+Task() {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                        <FONT SIZE=2 STYLE="font-size: 9pt">public
+Object execute() {</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                            <FONT SIZE=2 STYLE="font-size: 9pt">Util.sleep(15000);</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                            <FONT SIZE=2 STYLE="font-size: 9pt">return
+new Date();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">};</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">log(&quot;&lt;==
+result = &quot; + server.submit(task, 30000));</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>                    <FONT SIZE=2 STYLE="font-size: 9pt">break;</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>            <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>        <FONT SIZE=2 STYLE="font-size: 9pt">server.stop();</FONT></CODE></P>
+<P STYLE="border-top: 1px solid #000000; border-bottom: 1px solid #000000; border-left: none; border-right: none; padding: 0.04in 0in">
+<CODE>    <FONT SIZE=2 STYLE="font-size: 9pt">}</FONT></CODE></P>
+<P><BR><BR>
+</P>
+<P>The main() method creates a Server and starts it. The loop()
+method waits for a key press and then submits a short running (on
+'1') or long running (on '2') task. The task simply returns a new
+Date with the current time. The long running task sleep for 15
+seconds before returning the date. When 'q' is pressed, we stop the
+server gracefully and return.</P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Demo</H1>
+<P>Let's see whether this thing works ! The demo JAR can be
+downloaded <A HREF="http://www.jgroups.org/javagroupsnew/docs/taskdistribution/demo.jar">here</A>.</P>
+<P>Let's start some instances and submit some tasks. To start an
+instance, we run:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[linux]/home/bela/JGroupsArticles/dist$
+java -Djgroups.bind_addr=192.168.1.5 -jar demo.jar </FONT></TT>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">-------------------------------------------------------</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">GMS:
+address is 192.168.1.5:33795</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">-------------------------------------------------------</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">view:
+[192.168.1.5:33795|0] [192.168.1.5:33795]</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">my
+rank is 0</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[1]
+Submit [2] Submit long running task [3] Info [q] Quit</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>Replace the IP address set with -Djgroups.bind_addr with the one
+of a valid NIC. If you don't set this property, JGroups picks a
+random NIC.</P>
+<P>We can see that we're the first node in the cluster, our local
+address is 192.168.1.5:33795 and our rank is 0.</P>
+<P>When we submit a task, we see that it is executed by our self,
+since we're the only node in the cluster:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[1]
+Submit [2] Submit long running task [3] Info [q] Quit</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">==&gt;
+submitting 192.168.1.5:33795::1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">executing
+192.168.1.5:33795::1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">&lt;==
+result = Tue Sep 09 12:38:55 CEST 2008</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>Let's start a second instance:</P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">[linux]/home/bela/JGroupsArticles/dist$
+java -Djgroups.bind_addr=192.168.1.5 -jar demo.jar </FONT></TT>
+</P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">-------------------------------------------------------</FONT></TT></P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">GMS: address is
+192.168.1.5:41232</FONT></TT></P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">-------------------------------------------------------</FONT></TT></P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">view:
+[192.168.1.5:33795|1] [192.168.1.5:33795, 192.168.1.5:41232]</FONT></TT></P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">my rank is 1</FONT></TT></P>
+<P><TT><FONT SIZE=2 STYLE="font-size: 9pt">[1] Submit [2] Submit long
+running task [3] Info [q] Quit</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>We can see that the view now has 2 members: 192.168.1.5:33795 with
+rank=0 and 192.168.1.5:41232 (the second instance started) with
+rank=1. Note that for this demo, we start all instances as separate
+processes on the same host, but of course we would place those
+processes on different hosts in real life.</P>
+<P>If we now go back to the first instance and submit 2 tasks, we can
+see that they are assigned to both instances:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">==&gt;
+submitting 192.168.1.5:33795::2</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">executing
+192.168.1.5:33795::2</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">&lt;==
+result = Tue Sep 09 12:43:48 CEST 2008</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[1]
+Submit [2] Submit long running task [3] Info [q] Quit</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">==&gt;
+submitting 192.168.1.5:33795::3</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">&lt;==
+result = Tue Sep 09 12:43:49 CEST 2008</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>Task #2 was executed by our self, but task #3 was executed by the
+second instance (this can be verified by looking at the output of the
+second instance).</P>
+<P>Let's now start a third instance:</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[linux]/home/bela/JGroupsArticles/dist$
+java -Djgroups.bind_addr=192.168.1.5 -jar demo.jar </FONT></TT>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">-------------------------------------------------------</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">GMS:
+address is 192.168.1.5:45532</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">-------------------------------------------------------</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">view:
+[192.168.1.5:33795|2] [192.168.1.5:33795, 192.168.1.5:41232,
+192.168.1.5:45532]</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">my
+rank is 2</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[1]
+Submit [2] Submit long running task [3] Info [q] Quit</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>We see that the cluster now has 3 nodes, and the rank of the
+freshly started instance is 2.</P>
+<P><BR><BR>
+</P>
+<P>Now we'll submit a long running task T and - before T completes -
+kill the node which is processing T.</P>
+<P>Let's submit that task on the third instance:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">[1]
+Submit [2] Submit long running task [3] Info [q] Quit</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">2</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">==&gt;
+submitting 192.168.1.5:45532::1</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>Because the second instance has rank=1, task #1 from
+192.168.1.5:45532 is executed on that instance.</P>
+<P>Before the 15 seconds elapse, let's kill the second instance.
+After a few seconds, the output of the third instance shows the
+following:</P>
+<P><BR><BR>
+</P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">view:
+[192.168.1.5:33795|3] [192.168.1.5:33795, 192.168.1.5:45532]</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">my
+rank is 1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">****
+taking over task 192.168.1.5:45532::1 from 192.168.1.5:41232
+(submitted by 192.168.1.5:45532)</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">executing
+192.168.1.5:45532::1</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">sleeping
+for 15 secs...</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">done</FONT></TT></P>
+<P STYLE="border: 1px solid #000000; padding: 0.02in"><TT><FONT SIZE=2 STYLE="font-size: 9pt">&lt;==
+result = Tue Sep 09 12:55:10 CEST 2008</FONT></TT></P>
+<P><BR><BR>
+</P>
+<P>This might be somewhat surprising, but correct. Let's see what's
+happening.</P>
+<P>First we get a view change, the new view is <TT><FONT FACE="Times New Roman, serif"><FONT SIZE=3>192.168.1.5:33795,
+192.168.1.5:45532. This means that the third instance has now rank=1,
+which is exactly the rank the killed instance had. Therefore when
+task #1 is reassigned, it is the third node 192.168.1.5:41232 which
+executes #1.</FONT></FONT></TT></P>
+<P><TT><FONT FACE="Times New Roman, serif"><FONT SIZE=3>This happens
+to be the same node as the submitter, but that's okay: since we only
+have 2 node left in our cluster, there is a 50% chance of the
+submitter processing its own task. If we had more nodes in the
+cluster, the likelihood of a submitter processing its own task would
+decrease</FONT></FONT></TT><TT><FONT FACE="Times New Roman, serif"><FONT SIZE=3><A CLASS="sdfootnoteanc" NAME="sdfootnote7anc" HREF="#sdfootnote7sym"><SUP>7</SUP></A></FONT></FONT></TT><TT><FONT FACE="Times New Roman, serif"><FONT SIZE=3>.</FONT></FONT></TT></P>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Conclusion</H1>
+<P><BR><BR>
+</P>
+<P>We implemented a simple, highly decentralized, clustered task
+distribution system in roughly 500 lines of code and 5 classes. The
+system is failure resilient, because all nodes are peers and there's
+no central server. 
+</P>
+<P>All peers are equal (every peer can act as both master and slave)
+and tasks are grabbed by a node based on an ID assigned by the
+submitter (master). 
+</P>
+<P>Crashes or graceful termination of nodes doesn't lead to missing
+tasks, as the system re-balances itself and assigns orphaned tasks to
+another node in the cluster.</P>
+<P>The system is so small because it runs on top of JGroups. Had we
+written it without JGroups, we would have had to implement the
+following functionality ourselves:</P>
+<UL>
+	<LI><P>Cluster membership and failure detection: we need to know
+	when the membership changes, and all nodes in a cluster need to get
+	these views in <B>exactly</B> the same order</P>
+	<LI><P>Simulcasting (with UDP datagrams): fragmentation (if a task
+	or result is greater than 65K) and retransmission (UDP datagrams are
+	lost), plus suppression of duplicate messages  (we cannot receive
+	the same task multiple times !).</P>
+	<LI><P>Simple switching between transports (UDP, TCP), and
+	configuration/customization of the transport: e.g. adding
+	compression or encryption</P>
+</UL>
+<P><BR><BR>
+</P>
+<P>The current task distribution is far from complete (after all,
+this is just a demo of what can be done with JGroups !); possible
+further improvements include:</P>
+<UL>
+	<LI><P>Implementation java.util.concurrent.ExecutorService. This
+	would extend the in-VM thread pool to become a clustered thread
+	pool, where tasks are executed not only by threads in the same JVM,
+	but also by threads on different hosts. This would allow masters to
+	submit tasks (for example a collection of tasks) and to wait for
+	their completion <B>later</B>. In our current solution, the thread
+	of the caller of submit() is blocked until a timeout occurs or the
+	result becomes available.</P>
+	<LI><P>Not all nodes store the task, but only a subset of the nodes.
+	When a node X crashes, we ask everyone for the tasks assigned to X,
+	and these are returned by the nodes who stored them.</P>
+	<LI><P>Use random numbers to create ClusterIDs rather than
+	monotonically increasing ints. Currently, we use a round robin ID
+	allocation scheme. While this is pretty good at distributing all
+	tasks evenly, it might be better in some cases to assign weights to
+	individual cluster nodes, according to number of cores, memory etc.
+	Thus, tasks could be assigned more optimally, whereas in the current
+	solution we assign all tasks evenly, which means slower hosts get
+	the same number of tasks as faster hosts. We should probably
+	externalize the policy which creates the IDs and/or picks the nodes,
+	so it can be replaced.</P>
+</UL>
+<P><BR><BR>
+</P>
+<H1 CLASS="western">Download</H1>
+<P>The full demo code can be downloaded <A HREF="http://www.jgroups.org/javagroupsnew/docs/taskdistribution/demo.jar">here</A>
+([3]).</P>
+<H1 CLASS="western">Links</H1>
+<P><BR><BR>
+</P>
+<P>[1] <A HREF="http://www.jgroups.org/">http://www.jgroups.org</A></P>
+<P>[2]
+<A HREF="http://www.spiteful.com/2008/03/17/programmers-toolbox-part-3-consistent-hashing">http://www.spiteful.com/2008/03/17/programmers-toolbox-part-3-consistent-hashing</A></P>
+<P>[3]
+<A HREF="http://www.jgroups.org/javagroupsnew/docs/taskdistribution/demo.jar">http://www.jgroups.org/javagroupsnew/docs/taskdistribution/demo.jar</A></P>
+<DIV ID="sdfootnote1">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote1sym" HREF="#sdfootnote1anc">1</A>Note
+	that receive() can be invoked concurrently, when we receive messages
+	from different senders. It therefore needs to be reentrant.</P>
+</DIV>
+<DIV ID="sdfootnote2">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote2sym" HREF="#sdfootnote2anc">2</A>In
+	JGroups, it is the IP address and port of a node by default</P>
+</DIV>
+<DIV ID="sdfootnote3">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote3sym" HREF="#sdfootnote3anc">3</A>This
+	could of course be changed to have any <I>submitted</I> task be
+	executed even if its original submitter crashed</P>
+</DIV>
+<DIV ID="sdfootnote4">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote4sym" HREF="#sdfootnote4anc">4</A>All
+	code examples have been edited for brevity, e.g. no exception or
+	error handling is shown.</P>
+</DIV>
+<DIV ID="sdfootnote5">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote5sym" HREF="#sdfootnote5anc">5</A>This
+	is only done if we're not the submitter of the task, because in this
+	case the task will already be in the cache.</P>
+</DIV>
+<DIV ID="sdfootnote6">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote6sym" HREF="#sdfootnote6anc">6</A>For
+	the purpose of the demo. This could also be changed, as it probably
+	makes sense in some cases to execute a task even if the submitter
+	crashed.</P>
+</DIV>
+<DIV ID="sdfootnote7">
+	<P CLASS="sdfootnote"><A CLASS="sdfootnotesym" NAME="sdfootnote7sym" HREF="#sdfootnote7anc">7</A>We
+	could of course also change the system, such that a submitter never
+	executes its own tasks (unless there are no other nodes in the
+	cluster).</P>
+</DIV>
+</BODY>
+</HTML>
